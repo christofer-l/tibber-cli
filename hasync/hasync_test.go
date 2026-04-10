@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -11,9 +12,10 @@ import (
 	"github.com/christofer-l/tibber-cli/tibber"
 )
 
-type haRequest struct {
-	Path string
-	Body homeassistant.SensorState
+type mqttPublish struct {
+	Topic   string `json:"topic"`
+	Payload string `json:"payload"`
+	Retain  bool   `json:"retain"`
 }
 
 func fakeTibberServer(t *testing.T, prices, consumption tibber.GraphQLResponse) *httptest.Server {
@@ -30,19 +32,28 @@ func fakeTibberServer(t *testing.T, prices, consumption tibber.GraphQLResponse) 
 	}))
 }
 
-func fakeHAServer(t *testing.T, requests *[]haRequest) *httptest.Server {
+func fakeHAServer(t *testing.T, publishes *[]mqttPublish) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var body homeassistant.SensorState
-		json.NewDecoder(r.Body).Decode(&body)
-		*requests = append(*requests, haRequest{Path: r.URL.Path, Body: body})
+		var pub mqttPublish
+		json.NewDecoder(r.Body).Decode(&pub)
+		*publishes = append(*publishes, pub)
 		w.WriteHeader(http.StatusOK)
 	}))
 }
 
+// discoveryTopics extracts unique sensor IDs from discovery config topics
+func discoveryTopics(pubs []mqttPublish) map[string]bool {
+	topics := map[string]bool{}
+	for _, p := range pubs {
+		if strings.HasPrefix(p.Topic, "homeassistant/sensor/") && strings.HasSuffix(p.Topic, "/config") {
+			topics[p.Topic] = true
+		}
+	}
+	return topics
+}
+
 func makePriceResponse() tibber.GraphQLResponse {
-	// 10 hourly prices: 0.10, 0.20, ..., 1.00
-	// Current price is 0.90 (9th out of 10 = 80th percentile)
 	today := make([]tibber.Price, 10)
 	for i := range today {
 		today[i] = tibber.Price{
@@ -96,11 +107,11 @@ func makeConsumptionResponse() tibber.GraphQLResponse {
 	}
 }
 
-func TestRunPushesThreeSensors(t *testing.T) {
-	var haReqs []haRequest
+func TestRunPublishesFourSensors(t *testing.T) {
+	var pubs []mqttPublish
 	tibberSrv := fakeTibberServer(t, makePriceResponse(), makeConsumptionResponse())
 	defer tibberSrv.Close()
-	haSrv := fakeHAServer(t, &haReqs)
+	haSrv := fakeHAServer(t, &pubs)
 	defer haSrv.Close()
 
 	tc := tibber.NewTestClient("tok", tibberSrv.URL, tibberSrv.Client())
@@ -113,31 +124,25 @@ func TestRunPushesThreeSensors(t *testing.T) {
 	if n != 4 {
 		t.Errorf("synced %d sensors, want 4", n)
 	}
-	if len(haReqs) != 4 {
-		t.Fatalf("HA received %d requests, want 4", len(haReqs))
-	}
 
-	paths := map[string]bool{}
-	for _, r := range haReqs {
-		paths[r.Path] = true
-	}
+	topics := discoveryTopics(pubs)
 	for _, want := range []string{
-		"/api/states/sensor.tibber_price_current",
-		"/api/states/sensor.tibber_price_level",
-		"/api/states/sensor.tibber_consumption_hourly",
-		"/api/states/sensor.tibber_cost_hourly",
+		"homeassistant/sensor/tibber_price_current/config",
+		"homeassistant/sensor/tibber_price_level/config",
+		"homeassistant/sensor/tibber_consumption_hourly/config",
+		"homeassistant/sensor/tibber_cost_hourly/config",
 	} {
-		if !paths[want] {
-			t.Errorf("missing request to %s", want)
+		if !topics[want] {
+			t.Errorf("missing discovery topic: %s", want)
 		}
 	}
 }
 
 func TestRunUsesLatestConsumptionNode(t *testing.T) {
-	var haReqs []haRequest
+	var pubs []mqttPublish
 	tibberSrv := fakeTibberServer(t, makePriceResponse(), makeConsumptionResponse())
 	defer tibberSrv.Close()
-	haSrv := fakeHAServer(t, &haReqs)
+	haSrv := fakeHAServer(t, &pubs)
 	defer haSrv.Close()
 
 	tc := tibber.NewTestClient("tok", tibberSrv.URL, tibberSrv.Client())
@@ -148,17 +153,21 @@ func TestRunUsesLatestConsumptionNode(t *testing.T) {
 		t.Fatalf("Run failed: %v", err)
 	}
 
-	for _, r := range haReqs {
-		if r.Path == "/api/states/sensor.tibber_consumption_hourly" {
-			if r.Body.State != "2.300" {
-				t.Errorf("consumption state = %q, want %q", r.Body.State, "2.300")
+	for _, p := range pubs {
+		if p.Topic == "tibber_cli/tibber_consumption_hourly/state" {
+			var state homeassistant.SensorState
+			json.Unmarshal([]byte(p.Payload), &state)
+			if state.State != "2.300" {
+				t.Errorf("consumption state = %q, want %q", state.State, "2.300")
 			}
+			return
 		}
 	}
+	t.Error("consumption state topic not found")
 }
 
 func TestRunNoConsumptionData(t *testing.T) {
-	var haReqs []haRequest
+	var pubs []mqttPublish
 	emptyConsumption := tibber.GraphQLResponse{
 		Data: tibber.Data{Viewer: tibber.Viewer{Homes: []tibber.Home{{
 			Consumption: tibber.Consumption{Nodes: []tibber.ConsumptionNode{}},
@@ -166,7 +175,7 @@ func TestRunNoConsumptionData(t *testing.T) {
 	}
 	tibberSrv := fakeTibberServer(t, makePriceResponse(), emptyConsumption)
 	defer tibberSrv.Close()
-	haSrv := fakeHAServer(t, &haReqs)
+	haSrv := fakeHAServer(t, &pubs)
 	defer haSrv.Close()
 
 	tc := tibber.NewTestClient("tok", tibberSrv.URL, tibberSrv.Client())
@@ -182,10 +191,10 @@ func TestRunNoConsumptionData(t *testing.T) {
 }
 
 func TestRunPriceLevelPercentile(t *testing.T) {
-	var haReqs []haRequest
+	var pubs []mqttPublish
 	tibberSrv := fakeTibberServer(t, makePriceResponse(), makeConsumptionResponse())
 	defer tibberSrv.Close()
-	haSrv := fakeHAServer(t, &haReqs)
+	haSrv := fakeHAServer(t, &pubs)
 	defer haSrv.Close()
 
 	tc := tibber.NewTestClient("tok", tibberSrv.URL, tibberSrv.Client())
@@ -196,23 +205,50 @@ func TestRunPriceLevelPercentile(t *testing.T) {
 		t.Fatalf("Run failed: %v", err)
 	}
 
-	for _, r := range haReqs {
-		if r.Path == "/api/states/sensor.tibber_price_level" {
+	for _, p := range pubs {
+		if p.Topic == "tibber_cli/tibber_price_level/state" {
+			var state homeassistant.SensorState
+			json.Unmarshal([]byte(p.Payload), &state)
 			// Current price 0.90, prices are 0.10..1.00
 			// 9 out of 10 are <= 0.90, percentile = 90
-			if r.Body.State != "90" {
-				t.Errorf("price_level state = %q, want %q", r.Body.State, "90")
-			}
-			if r.Body.Attributes["min"] != 0.10 {
-				t.Errorf("min = %v, want 0.10", r.Body.Attributes["min"])
-			}
-			if r.Body.Attributes["max"] != 1.0 {
-				t.Errorf("max = %v, want 1.00", r.Body.Attributes["max"])
+			if state.State != "90" {
+				t.Errorf("price_level state = %q, want %q", state.State, "90")
 			}
 			return
 		}
 	}
-	t.Error("price_level sensor not found in HA requests")
+	t.Error("price_level state topic not found")
+}
+
+func TestRunPriceLevelAttributes(t *testing.T) {
+	var pubs []mqttPublish
+	tibberSrv := fakeTibberServer(t, makePriceResponse(), makeConsumptionResponse())
+	defer tibberSrv.Close()
+	haSrv := fakeHAServer(t, &pubs)
+	defer haSrv.Close()
+
+	tc := tibber.NewTestClient("tok", tibberSrv.URL, tibberSrv.Client())
+	hac := homeassistant.NewTestClient(haSrv.URL, "ha-tok", haSrv.Client())
+
+	_, err := Run(tc, hac)
+	if err != nil {
+		t.Fatalf("Run failed: %v", err)
+	}
+
+	for _, p := range pubs {
+		if p.Topic == "tibber_cli/tibber_price_level/attributes" {
+			var attrs map[string]any
+			json.Unmarshal([]byte(p.Payload), &attrs)
+			if attrs["min"] != 0.1 {
+				t.Errorf("min = %v, want 0.1", attrs["min"])
+			}
+			if attrs["max"] != 1.0 {
+				t.Errorf("max = %v, want 1.0", attrs["max"])
+			}
+			return
+		}
+	}
+	t.Error("price_level attributes topic not found")
 }
 
 func TestPercentile(t *testing.T) {
@@ -237,13 +273,13 @@ func TestPercentile(t *testing.T) {
 }
 
 func TestRunTibberError(t *testing.T) {
-	var haReqs []haRequest
+	var pubs []mqttPublish
 	tibberSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		w.Write([]byte("internal error"))
 	}))
 	defer tibberSrv.Close()
-	haSrv := fakeHAServer(t, &haReqs)
+	haSrv := fakeHAServer(t, &pubs)
 	defer haSrv.Close()
 
 	tc := tibber.NewTestClient("tok", tibberSrv.URL, tibberSrv.Client())
@@ -253,7 +289,7 @@ func TestRunTibberError(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
-	if len(haReqs) != 0 {
-		t.Errorf("HA received %d requests, want 0", len(haReqs))
+	if len(pubs) != 0 {
+		t.Errorf("HA received %d publishes, want 0", len(pubs))
 	}
 }

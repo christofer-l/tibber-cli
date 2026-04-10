@@ -69,22 +69,25 @@ func Run(tc *tibber.Client, hac *homeassistant.Client) (int, error) {
 	home := homes[0]
 	price := home.CurrentSubscription.PriceInfo.Current
 	currency := price.Currency
+	timeFormat := "2006-01-02T15:04:05-07:00"
 
 	count := 0
 
 	// Push current price
-	err = hac.SetState("sensor.tibber_price_current", homeassistant.SensorState{
+	err = hac.PublishSensor("tibber_price_current", homeassistant.MQTTDiscoveryConfig{
+		Name:              "Tibber Current Price",
+		UniqueID:          "tibber_price_current",
+		UnitOfMeasurement: currency + "/kWh",
+	}, homeassistant.SensorState{
 		State: fmt.Sprintf("%.4f", price.Total),
 		Attributes: map[string]any{
-			"unit_of_measurement": currency + "/kWh",
-			"friendly_name":      "Tibber Current Price",
-			"energy":             price.Energy,
-			"tax":                price.Tax,
-			"starts_at":          price.StartsAt.Format("2006-01-02T15:04:05-07:00"),
+			"energy":    price.Energy,
+			"tax":       price.Tax,
+			"starts_at": price.StartsAt.Format(timeFormat),
 		},
 	})
 	if err != nil {
-		return count, fmt.Errorf("set price sensor: %w", err)
+		return count, fmt.Errorf("publish price sensor: %w", err)
 	}
 	count++
 
@@ -93,28 +96,29 @@ func Run(tc *tibber.Client, hac *homeassistant.Client) (int, error) {
 	pct := percentile(price.Total, todayPrices)
 	minP, maxP, avgP := priceStats(todayPrices)
 
-	attrs := map[string]any{
-		"unit_of_measurement": "%",
-		"friendly_name":      "Tibber Price Level",
-		"percentile":         pct,
-		"min":                minP,
-		"max":                maxP,
-		"avg":                avgP,
-		"current_price":      price.Total,
-		"currency":           currency,
-		"today":              priceForecast(todayPrices),
+	levelAttrs := map[string]any{
+		"min":           minP,
+		"max":           maxP,
+		"avg":           avgP,
+		"current_price": price.Total,
+		"currency":      currency,
+		"today":         priceForecast(todayPrices),
 	}
 	tomorrowPrices := home.CurrentSubscription.PriceInfo.Tomorrow
 	if len(tomorrowPrices) > 0 {
-		attrs["tomorrow"] = priceForecast(tomorrowPrices)
+		levelAttrs["tomorrow"] = priceForecast(tomorrowPrices)
 	}
 
-	err = hac.SetState("sensor.tibber_price_level", homeassistant.SensorState{
+	err = hac.PublishSensor("tibber_price_level", homeassistant.MQTTDiscoveryConfig{
+		Name:              "Tibber Price Level",
+		UniqueID:          "tibber_price_level",
+		UnitOfMeasurement: "%",
+	}, homeassistant.SensorState{
 		State:      fmt.Sprintf("%d", pct),
-		Attributes: attrs,
+		Attributes: levelAttrs,
 	})
 	if err != nil {
-		return count, fmt.Errorf("set price level sensor: %w", err)
+		return count, fmt.Errorf("publish price level sensor: %w", err)
 	}
 	count++
 
@@ -144,40 +148,42 @@ func Run(tc *tibber.Client, hac *homeassistant.Client) (int, error) {
 		return count, nil
 	}
 
-	timeFormat := "2006-01-02T15:04:05-07:00"
-
 	// Push consumption
-	err = hac.SetState("sensor.tibber_consumption_hourly", homeassistant.SensorState{
+	err = hac.PublishSensor("tibber_consumption_hourly", homeassistant.MQTTDiscoveryConfig{
+		Name:              "Tibber Hourly Consumption",
+		UniqueID:          "tibber_consumption_hourly",
+		UnitOfMeasurement: "kWh",
+		DeviceClass:       "energy",
+		StateClass:        "measurement",
+	}, homeassistant.SensorState{
 		State: fmt.Sprintf("%.3f", latest.Consumption),
 		Attributes: map[string]any{
-			"unit_of_measurement": "kWh",
-			"friendly_name":      "Tibber Hourly Consumption",
-			"device_class":       "energy",
-			"state_class":        "measurement",
-			"from":               latest.From.Format(timeFormat),
-			"to":                 latest.To.Format(timeFormat),
+			"from": latest.From.Format(timeFormat),
+			"to":   latest.To.Format(timeFormat),
 		},
 	})
 	if err != nil {
-		return count, fmt.Errorf("set consumption sensor: %w", err)
+		return count, fmt.Errorf("publish consumption sensor: %w", err)
 	}
 	count++
 
 	// Push cost
-	err = hac.SetState("sensor.tibber_cost_hourly", homeassistant.SensorState{
+	err = hac.PublishSensor("tibber_cost_hourly", homeassistant.MQTTDiscoveryConfig{
+		Name:              "Tibber Hourly Cost",
+		UniqueID:          "tibber_cost_hourly",
+		UnitOfMeasurement: currency,
+		DeviceClass:       "monetary",
+		StateClass:        "measurement",
+	}, homeassistant.SensorState{
 		State: fmt.Sprintf("%.2f", latest.Cost),
 		Attributes: map[string]any{
-			"unit_of_measurement": currency,
-			"friendly_name":      "Tibber Hourly Cost",
-			"device_class":       "monetary",
-			"state_class":        "measurement",
-			"from":               latest.From.Format(timeFormat),
-			"to":                 latest.To.Format(timeFormat),
-			"unit_price":         latest.UnitPrice,
+			"from":       latest.From.Format(timeFormat),
+			"to":         latest.To.Format(timeFormat),
+			"unit_price": latest.UnitPrice,
 		},
 	})
 	if err != nil {
-		return count, fmt.Errorf("set cost sensor: %w", err)
+		return count, fmt.Errorf("publish cost sensor: %w", err)
 	}
 	count++
 
