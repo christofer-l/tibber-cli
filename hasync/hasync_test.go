@@ -41,16 +41,33 @@ func fakeHAServer(t *testing.T, requests *[]haRequest) *httptest.Server {
 }
 
 func makePriceResponse() tibber.GraphQLResponse {
+	// 10 hourly prices: 0.10, 0.20, ..., 1.00
+	// Current price is 0.90 (9th out of 10 = 80th percentile)
+	today := make([]tibber.Price, 10)
+	for i := range today {
+		today[i] = tibber.Price{
+			Total:    float64(i+1) * 0.10,
+			Energy:   float64(i+1) * 0.07,
+			Tax:      float64(i+1) * 0.03,
+			Currency: "SEK",
+			StartsAt: time.Date(2026, 4, 10, i, 0, 0, 0, time.UTC),
+		}
+	}
+	tomorrow := []tibber.Price{
+		{Total: 0.55, Energy: 0.40, Tax: 0.15, Currency: "SEK", StartsAt: time.Date(2026, 4, 11, 0, 0, 0, 0, time.UTC)},
+	}
 	return tibber.GraphQLResponse{
 		Data: tibber.Data{Viewer: tibber.Viewer{Homes: []tibber.Home{{
 			CurrentSubscription: tibber.Subscription{PriceInfo: tibber.PriceInfo{
 				Current: tibber.Price{
-					Total:    0.4523,
-					Energy:   0.3200,
-					Tax:      0.1323,
+					Total:    0.90,
+					Energy:   0.63,
+					Tax:      0.27,
 					Currency: "SEK",
-					StartsAt: time.Date(2026, 4, 10, 14, 0, 0, 0, time.UTC),
+					StartsAt: time.Date(2026, 4, 10, 8, 0, 0, 0, time.UTC),
 				},
+				Today:    today,
+				Tomorrow: tomorrow,
 			}},
 		}}}},
 	}
@@ -93,11 +110,11 @@ func TestRunPushesThreeSensors(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run failed: %v", err)
 	}
-	if n != 3 {
-		t.Errorf("synced %d sensors, want 3", n)
+	if n != 4 {
+		t.Errorf("synced %d sensors, want 4", n)
 	}
-	if len(haReqs) != 3 {
-		t.Fatalf("HA received %d requests, want 3", len(haReqs))
+	if len(haReqs) != 4 {
+		t.Fatalf("HA received %d requests, want 4", len(haReqs))
 	}
 
 	paths := map[string]bool{}
@@ -106,6 +123,7 @@ func TestRunPushesThreeSensors(t *testing.T) {
 	}
 	for _, want := range []string{
 		"/api/states/sensor.tibber_price_current",
+		"/api/states/sensor.tibber_price_level",
 		"/api/states/sensor.tibber_consumption_hourly",
 		"/api/states/sensor.tibber_cost_hourly",
 	} {
@@ -158,8 +176,63 @@ func TestRunNoConsumptionData(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run failed: %v", err)
 	}
-	if n != 1 {
-		t.Errorf("synced %d sensors, want 1 (price only)", n)
+	if n != 2 {
+		t.Errorf("synced %d sensors, want 2 (price + price_level only)", n)
+	}
+}
+
+func TestRunPriceLevelPercentile(t *testing.T) {
+	var haReqs []haRequest
+	tibberSrv := fakeTibberServer(t, makePriceResponse(), makeConsumptionResponse())
+	defer tibberSrv.Close()
+	haSrv := fakeHAServer(t, &haReqs)
+	defer haSrv.Close()
+
+	tc := tibber.NewTestClient("tok", tibberSrv.URL, tibberSrv.Client())
+	hac := homeassistant.NewTestClient(haSrv.URL, "ha-tok", haSrv.Client())
+
+	_, err := Run(tc, hac)
+	if err != nil {
+		t.Fatalf("Run failed: %v", err)
+	}
+
+	for _, r := range haReqs {
+		if r.Path == "/api/states/sensor.tibber_price_level" {
+			// Current price 0.90, prices are 0.10..1.00
+			// 9 out of 10 are <= 0.90, percentile = 90
+			if r.Body.State != "90" {
+				t.Errorf("price_level state = %q, want %q", r.Body.State, "90")
+			}
+			if r.Body.Attributes["min"] != 0.10 {
+				t.Errorf("min = %v, want 0.10", r.Body.Attributes["min"])
+			}
+			if r.Body.Attributes["max"] != 1.0 {
+				t.Errorf("max = %v, want 1.00", r.Body.Attributes["max"])
+			}
+			return
+		}
+	}
+	t.Error("price_level sensor not found in HA requests")
+}
+
+func TestPercentile(t *testing.T) {
+	prices := []tibber.Price{
+		{Total: 0.10}, {Total: 0.20}, {Total: 0.30}, {Total: 0.40}, {Total: 0.50},
+	}
+	tests := []struct {
+		current float64
+		want    int
+	}{
+		{0.10, 20},  // 1 out of 5 <= 0.10
+		{0.30, 60},  // 3 out of 5 <= 0.30
+		{0.50, 100}, // 5 out of 5 <= 0.50
+		{0.05, 0},   // 0 out of 5 < 0.05
+	}
+	for _, tt := range tests {
+		got := percentile(tt.current, prices)
+		if got != tt.want {
+			t.Errorf("percentile(%.2f) = %d, want %d", tt.current, got, tt.want)
+		}
 	}
 }
 

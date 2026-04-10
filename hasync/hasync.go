@@ -2,10 +2,60 @@ package hasync
 
 import (
 	"fmt"
+	"sort"
 
 	"github.com/christofer-l/tibber-cli/homeassistant"
 	"github.com/christofer-l/tibber-cli/tibber"
 )
+
+func percentile(current float64, prices []tibber.Price) int {
+	if len(prices) == 0 {
+		return 0
+	}
+	count := 0
+	for _, p := range prices {
+		if p.Total <= current {
+			count++
+		}
+	}
+	return count * 100 / len(prices)
+}
+
+func priceStats(prices []tibber.Price) (min, max, avg float64) {
+	if len(prices) == 0 {
+		return
+	}
+	min = prices[0].Total
+	max = prices[0].Total
+	sum := 0.0
+	for _, p := range prices {
+		if p.Total < min {
+			min = p.Total
+		}
+		if p.Total > max {
+			max = p.Total
+		}
+		sum += p.Total
+	}
+	avg = sum / float64(len(prices))
+	return
+}
+
+func priceForecast(prices []tibber.Price) []map[string]any {
+	sorted := make([]tibber.Price, len(prices))
+	copy(sorted, prices)
+	sort.Slice(sorted, func(i, j int) bool {
+		return sorted[i].StartsAt.Before(sorted[j].StartsAt)
+	})
+	result := make([]map[string]any, len(sorted))
+	for i, p := range sorted {
+		result[i] = map[string]any{
+			"starts_at": p.StartsAt.Format("2006-01-02T15:04:05-07:00"),
+			"total":     p.Total,
+		}
+	}
+	return result
+}
 
 func Run(tc *tibber.Client, hac *homeassistant.Client) (int, error) {
 	homes, err := tc.GetPrices()
@@ -35,6 +85,36 @@ func Run(tc *tibber.Client, hac *homeassistant.Client) (int, error) {
 	})
 	if err != nil {
 		return count, fmt.Errorf("set price sensor: %w", err)
+	}
+	count++
+
+	// Push price level (percentile rank for today)
+	todayPrices := home.CurrentSubscription.PriceInfo.Today
+	pct := percentile(price.Total, todayPrices)
+	minP, maxP, avgP := priceStats(todayPrices)
+
+	attrs := map[string]any{
+		"unit_of_measurement": "%",
+		"friendly_name":      "Tibber Price Level",
+		"percentile":         pct,
+		"min":                minP,
+		"max":                maxP,
+		"avg":                avgP,
+		"current_price":      price.Total,
+		"currency":           currency,
+		"today":              priceForecast(todayPrices),
+	}
+	tomorrowPrices := home.CurrentSubscription.PriceInfo.Tomorrow
+	if len(tomorrowPrices) > 0 {
+		attrs["tomorrow"] = priceForecast(tomorrowPrices)
+	}
+
+	err = hac.SetState("sensor.tibber_price_level", homeassistant.SensorState{
+		State:      fmt.Sprintf("%d", pct),
+		Attributes: attrs,
+	})
+	if err != nil {
+		return count, fmt.Errorf("set price level sensor: %w", err)
 	}
 	count++
 
