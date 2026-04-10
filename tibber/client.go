@@ -24,6 +24,15 @@ func NewClient(token string) *Client {
 	}
 }
 
+// NewTestClient creates a client pointing at a custom URL, for testing.
+func NewTestClient(token, apiURL string, httpClient *http.Client) *Client {
+	return &Client{
+		token:      token,
+		apiURL:     apiURL,
+		httpClient: httpClient,
+	}
+}
+
 func (c *Client) query(gql string, variables map[string]any) (*GraphQLResponse, error) {
 	reqBody := GraphQLRequest{
 		Query:     gql,

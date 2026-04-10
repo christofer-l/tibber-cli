@@ -6,6 +6,8 @@ import (
 	"os"
 
 	"github.com/christofer-l/tibber-cli/display"
+	"github.com/christofer-l/tibber-cli/hasync"
+	"github.com/christofer-l/tibber-cli/homeassistant"
 	"github.com/christofer-l/tibber-cli/tibber"
 )
 
@@ -65,6 +67,24 @@ func main() {
 			display.PrintPriceTable(os.Stdout, pi.Tomorrow, "Tomorrow's prices")
 		}
 
+	case "sync":
+		haURL := os.Getenv("HA_URL")
+		if haURL == "" {
+			haURL = "http://homeassistant:8123"
+		}
+		haToken := os.Getenv("HA_TOKEN")
+		if haToken == "" {
+			fmt.Fprintln(os.Stderr, "HA_TOKEN environment variable is required.")
+			os.Exit(1)
+		}
+		haClient := homeassistant.NewClient(haURL, haToken)
+		n, err := hasync.Run(client, haClient)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("Synced %d sensors to Home Assistant\n", n)
+
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command: %s\n", cmd)
 		printUsage()
@@ -79,7 +99,10 @@ Commands:
   homes                    List your Tibber homes
   consumption [--hours N]  Show hourly consumption (default: 24h)
   prices                   Show today's and tomorrow's energy prices
+  sync                     Push consumption & prices to Home Assistant
 
 Environment:
-  TIBBER_TOKEN   Your Tibber personal access token`)
+  TIBBER_TOKEN   Your Tibber personal access token
+  HA_URL         Home Assistant URL (default: http://homeassistant:8123)
+  HA_TOKEN       Home Assistant long-lived access token`)
 }
