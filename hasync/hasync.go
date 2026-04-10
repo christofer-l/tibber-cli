@@ -41,6 +41,37 @@ func priceStats(prices []tibber.Price) (min, max, avg float64) {
 	return
 }
 
+// cheapestBlock finds the cheapest consecutive block of n hours in the price list.
+// Returns the start time and average price of the block.
+func cheapestBlock(prices []tibber.Price, n int) (startsAt string, avgPrice float64) {
+	if len(prices) == 0 || n <= 0 || n > len(prices) {
+		return "", 0
+	}
+
+	sorted := make([]tibber.Price, len(prices))
+	copy(sorted, prices)
+	sort.Slice(sorted, func(i, j int) bool {
+		return sorted[i].StartsAt.Before(sorted[j].StartsAt)
+	})
+
+	bestSum := 0.0
+	for i := 0; i < n; i++ {
+		bestSum += sorted[i].Total
+	}
+	bestStart := 0
+
+	currentSum := bestSum
+	for i := 1; i <= len(sorted)-n; i++ {
+		currentSum = currentSum - sorted[i-1].Total + sorted[i+n-1].Total
+		if currentSum < bestSum {
+			bestSum = currentSum
+			bestStart = i
+		}
+	}
+
+	return sorted[bestStart].StartsAt.Format("2006-01-02T15:04:05-07:00"), bestSum / float64(n)
+}
+
 func priceForecast(prices []tibber.Price) []map[string]any {
 	sorted := make([]tibber.Price, len(prices))
 	copy(sorted, prices)
@@ -71,6 +102,9 @@ func Run(tc *tibber.Client, hac *homeassistant.Client) (int, error) {
 	currency := price.Currency
 	timeFormat := "2006-01-02T15:04:05-07:00"
 
+	todayPrices := home.CurrentSubscription.PriceInfo.Today
+	tomorrowPrices := home.CurrentSubscription.PriceInfo.Tomorrow
+
 	count := 0
 
 	// Push current price
@@ -91,8 +125,19 @@ func Run(tc *tibber.Client, hac *homeassistant.Client) (int, error) {
 	}
 	count++
 
+	// Push Tibber price label (CHEAP, NORMAL, EXPENSIVE, VERY_EXPENSIVE)
+	err = hac.PublishSensor("tibber_price_label", homeassistant.MQTTDiscoveryConfig{
+		Name:     "Tibber Price Label",
+		UniqueID: "tibber_price_label",
+	}, homeassistant.SensorState{
+		State: price.Level,
+	})
+	if err != nil {
+		return count, fmt.Errorf("publish price label sensor: %w", err)
+	}
+	count++
+
 	// Push price level (percentile rank for today)
-	todayPrices := home.CurrentSubscription.PriceInfo.Today
 	pct := percentile(price.Total, todayPrices)
 	minP, maxP, avgP := priceStats(todayPrices)
 
@@ -104,7 +149,6 @@ func Run(tc *tibber.Client, hac *homeassistant.Client) (int, error) {
 		"currency":      currency,
 		"today":         priceForecast(todayPrices),
 	}
-	tomorrowPrices := home.CurrentSubscription.PriceInfo.Tomorrow
 	if len(tomorrowPrices) > 0 {
 		levelAttrs["tomorrow"] = priceForecast(tomorrowPrices)
 	}
@@ -119,6 +163,41 @@ func Run(tc *tibber.Client, hac *homeassistant.Client) (int, error) {
 	})
 	if err != nil {
 		return count, fmt.Errorf("publish price level sensor: %w", err)
+	}
+	count++
+
+	// Push cheapest upcoming hours
+	allPrices := append(todayPrices, tomorrowPrices...)
+	now := price.StartsAt
+	var futurePrices []tibber.Price
+	for _, p := range allPrices {
+		if !p.StartsAt.Before(now) {
+			futurePrices = append(futurePrices, p)
+		}
+	}
+	if len(futurePrices) == 0 {
+		futurePrices = todayPrices
+	}
+
+	cheapestAttrs := map[string]any{}
+	for _, hours := range []int{1, 3, 6} {
+		if hours <= len(futurePrices) {
+			start, avg := cheapestBlock(futurePrices, hours)
+			cheapestAttrs[fmt.Sprintf("cheapest_%dh_start", hours)] = start
+			cheapestAttrs[fmt.Sprintf("cheapest_%dh_avg_price", hours)] = avg
+		}
+	}
+	start1, _ := cheapestBlock(futurePrices, 1)
+
+	err = hac.PublishSensor("tibber_cheapest_hours", homeassistant.MQTTDiscoveryConfig{
+		Name:     "Tibber Cheapest Hours",
+		UniqueID: "tibber_cheapest_hours",
+	}, homeassistant.SensorState{
+		State:      start1,
+		Attributes: cheapestAttrs,
+	})
+	if err != nil {
+		return count, fmt.Errorf("publish cheapest hours sensor: %w", err)
 	}
 	count++
 
@@ -186,6 +265,63 @@ func Run(tc *tibber.Client, hac *homeassistant.Client) (int, error) {
 		return count, fmt.Errorf("publish cost sensor: %w", err)
 	}
 	count++
+
+	// Fetch daily consumption for yesterday
+	dailyHomes, err := tc.GetDailyConsumption(3)
+	if err != nil {
+		return count, fmt.Errorf("fetch daily consumption: %w", err)
+	}
+
+	if len(dailyHomes) > 0 && len(dailyHomes[0].Consumption.Nodes) > 0 {
+		dailyNodes := dailyHomes[0].Consumption.Nodes
+		// Find the most recent complete day
+		var yesterday *tibber.ConsumptionNode
+		for i := len(dailyNodes) - 1; i >= 0; i-- {
+			if dailyNodes[i].Consumption > 0 {
+				yesterday = &dailyNodes[i]
+				break
+			}
+		}
+
+		if yesterday != nil {
+			err = hac.PublishSensor("tibber_consumption_daily", homeassistant.MQTTDiscoveryConfig{
+				Name:              "Tibber Daily Consumption",
+				UniqueID:          "tibber_consumption_daily",
+				UnitOfMeasurement: "kWh",
+				DeviceClass:       "energy",
+				StateClass:        "measurement",
+			}, homeassistant.SensorState{
+				State: fmt.Sprintf("%.2f", yesterday.Consumption),
+				Attributes: map[string]any{
+					"from": yesterday.From.Format(timeFormat),
+					"to":   yesterday.To.Format(timeFormat),
+				},
+			})
+			if err != nil {
+				return count, fmt.Errorf("publish daily consumption sensor: %w", err)
+			}
+			count++
+
+			err = hac.PublishSensor("tibber_cost_daily", homeassistant.MQTTDiscoveryConfig{
+				Name:              "Tibber Daily Cost",
+				UniqueID:          "tibber_cost_daily",
+				UnitOfMeasurement: currency,
+				DeviceClass:       "monetary",
+				StateClass:        "measurement",
+			}, homeassistant.SensorState{
+				State: fmt.Sprintf("%.2f", yesterday.Cost),
+				Attributes: map[string]any{
+					"from":       yesterday.From.Format(timeFormat),
+					"to":         yesterday.To.Format(timeFormat),
+					"avg_price":  yesterday.UnitPrice,
+				},
+			})
+			if err != nil {
+				return count, fmt.Errorf("publish daily cost sensor: %w", err)
+			}
+			count++
+		}
+	}
 
 	return count, nil
 }

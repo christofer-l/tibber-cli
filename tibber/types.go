@@ -55,6 +55,7 @@ type Price struct {
 	Tax      float64   `json:"tax"`
 	StartsAt time.Time `json:"startsAt"`
 	Currency string    `json:"currency"`
+	Level    string    `json:"level"`
 }
 
 type Consumption struct {

@@ -44,6 +44,7 @@ const PricesQuery = `{
             tax
             startsAt
             currency
+            level
           }
           today {
             total
@@ -51,6 +52,7 @@ const PricesQuery = `{
             tax
             startsAt
             currency
+            level
           }
           tomorrow {
             total
@@ -58,7 +60,26 @@ const PricesQuery = `{
             tax
             startsAt
             currency
+            level
           }
+        }
+      }
+    }
+  }
+}`
+
+const DailyConsumptionQuery = `query ($last: Int!) {
+  viewer {
+    homes {
+      consumption(resolution: DAILY, last: $last) {
+        nodes {
+          from
+          to
+          cost
+          unitPrice
+          unitPriceVAT
+          consumption
+          consumptionUnit
         }
       }
     }

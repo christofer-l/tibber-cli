@@ -94,6 +94,15 @@ func (c *Client) GetConsumption(last int) ([]Home, error) {
 	return resp.Data.Viewer.Homes, nil
 }
 
+func (c *Client) GetDailyConsumption(last int) ([]Home, error) {
+	vars := map[string]any{"last": last}
+	resp, err := c.query(DailyConsumptionQuery, vars)
+	if err != nil {
+		return nil, err
+	}
+	return resp.Data.Viewer.Homes, nil
+}
+
 func (c *Client) GetPrices() ([]Home, error) {
 	resp, err := c.query(PricesQuery, nil)
 	if err != nil {
